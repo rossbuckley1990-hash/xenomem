@@ -13,14 +13,16 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
-      - name: Compile with strict warnings (-O3 -Wall -Wextra)
+      - name: Compile demo & 256GB torture suite (-O3 -Wall -Wextra)
         run: make
-      - name: Enforce Zero PRNG / Zero /dev/urandom Imports in Binary
+      - name: Enforce Zero PRNG / Zero /dev/urandom Imports in Binaries
         run: |
-          nm -u ./xenomem
-          if nm -u ./xenomem | grep -E 'rand|random|getentropy|open'; then
+          nm -u ./xenomem ./xenomem_stress
+          if nm -u ./xenomem ./xenomem_stress | grep -E 'rand|random|getentropy|open'; then
             echo "Forbidden PRNG or entropy file symbol detected!"
             exit 1
           fi
-      - name: Execute 64GB Observer-Collapse & Vacuum Decay Proof
+      - name: Execute 64GB Demo & Invariant Self-Audit
         run: ./xenomem
+      - name: Execute 256GB / 16-Thread / 4,250-Clause Stress Suite
+        run: ./xenomem_stress

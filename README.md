@@ -2,89 +2,69 @@
 
 # xenomem
 
-### What if reading an unallocated pointer didn't crash your program—<br>it solved an NP-hard problem using CPU data races?
+### Demand-paged constraint memory on Apple Silicon: reserve 64 GB of `PROT_NONE` address space, attach 3-SAT / Ising rules, and trigger WalkSAT solves via `SIGBUS` reads & writes.
 
 [![CI](https://github.com/rossbuckley1990-hash/xenomem/actions/workflows/ci.yml/badge.svg)](https://github.com/rossbuckley1990-hash/xenomem/actions/workflows/ci.yml)
 ![Language](https://img.shields.io/badge/pure_C11-zero_dependencies-black)
-![PRNGs](https://img.shields.io/badge/rand()_calls-0_(verified_in_CI)-brightgreen)
-![Apple Silicon](https://img.shields.io/badge/Apple_Silicon-M1–M5-blue)
+![PRNGs](https://img.shields.io/badge/PRNG_imports-0_(verified_in_CI)-brightgreen)
+![Apple Silicon](https://img.shields.io/badge/macOS-ARM64-blue)
 [![License: MIT](https://img.shields.io/badge/license-MIT-purple.svg)](LICENSE)
-
-**XenoMem** breaks every rule you learned in CS 101.<br>
-Declare a **64 GB** array backed by **0 bytes of RAM**, attach logical rules to it, **never call a solver**, and just read `reality[index]` straight out of empty memory.
 
 </div>
 
 ---
 
-## Code That Should Immediately Segfault (But Doesn't)
+## What It Actually Is (No Hype)
+
+**XenoMem** is a ~600-line C11 virtual-memory experiment for macOS / Apple Silicon that hides an incremental WalkSAT / Ising solver behind hardware MMU page faults (`SIGBUS` / `SIGSEGV`) and ARM64 exception-syndrome (`ESR_EL1`) write traps:
 
 ```c
-// 1. Create 64 Gigabytes of completely unallocated, unreadable void (0 KB of RAM)
+// 1. Reserve 64 GB of unmapped PROT_NONE virtual address space (~1.5 MB process footprint)
 volatile int8_t *reality;
 xeno_init(64ULL * GB, (int8_t **)&reality);
 
-// 2. Attach rules (e.g. 425 boolean 3-SAT clauses, or entangle two bytes 48 GB apart)
-xeno_bind_variable(0, 0ULL * GB + 256);    // Byte at 0 GB
-xeno_bind_variable(1, 48ULL * GB + 256);   // Byte at 48 GB (in unallocated void!)
-xeno_add_ising_coupling(0, 1, -5);         // Law: Byte[0 GB] must always oppose Byte[48 GB]
+// 2. Bind spin variables (+/-1) to arbitrary offsets across the 64 GB region & add couplings
+xeno_bind_variable(0, 0ULL * GB + 256);
+xeno_bind_variable(1, 48ULL * GB + 256);
+xeno_add_ising_coupling(0, 1, -5);           // Anti-ferromagnetic constraint: s_0 == -s_1
 
-// 3. DO NOT CALL A SOLVER. Just dereference the unallocated pointers:
-int8_t a = reality[0ULL * GB + 256];       // -> +1  (collapsed on read!)
-int8_t b = reality[48ULL * GB + 256];      // -> -1  (already entangled 48 GB away!)
-```
+// 3. Reading an unmapped pointer faults into SIGBUS, runs WalkSAT on a worker thread,
+//    and maps ONLY that 16 KB page:
+int8_t a = reality[0ULL * GB + 256];         // -> +1
+int8_t b = reality[48ULL * GB + 256];        // -> -1
 
-Now watch what happens if you create a **time-travel paradox**:
-
-```c
-// Force Byte[48 GB] to be +1 — contradicting the +1 you ALREADY read at Byte[0 GB]!
-xeno_impose_measurement(1, +1);
-
-// Nobody writes to Byte[0 GB]. Just read the exact same pointer again:
-int8_t a_new = reality[0ULL * GB + 256];   // -> -1  (the past rewrote itself!)
+// 4. Writing directly to a bound pointer traps via ARM64 ESR_EL1 (WnR=1), pins the variable,
+//    and resets contradicted pages back to PROT_NONE so subsequent reads re-solve consistently:
+reality[48ULL * GB + 256] = +1;
+int8_t a_new = reality[0ULL * GB + 256];     // -> -1
 ```
 
 ---
 
-## Wait... How Is This Possible? (The 20-Second Explanation)
+## How Each Mechanism Works Under the Hood
 
-Every computer program since 1945 treats **segfaults** and **multi-core data races** as fatal bugs. XenoMem uses them as its CPU:
-
-1. **64 GB of "Schrödinger Memory" (`0 KB` RAM):** `xeno_init` reserves 64 GB of virtual address space marked `PROT_NONE`. Nothing exists in physical RAM until you look at it.
-2. **Segfaults = Wavefunction Collapse:** The nanosecond your CPU executes a load instruction (`ldr`) on an unobserved address, the hardware MMU freezes the instruction mid-flight (`SIGBUS`). XenoMem solves only what is needed, materializes that single `16 KB` page (`mprotect`), and resumes your exact CPU instruction as if the answer was always there.
-3. **CPU Data Races = True Physical Annealing (`0` `rand()` calls):** `<stdlib.h>` isn't even `#include`d in `xenomem.c` (our GitHub Actions CI fails if `nm -u` finds `rand`, `arc4random`, or `open`). Instead, 3 threads on Apple Silicon's **4.6 GHz Performance clock** collide head-on *without locks* against 3 threads on the **3.0 GHz Efficiency clock**. Real physical silicon clock-drift and cache collisions produce **`7.98 / 8.00 bits/byte`** of true thermal entropy to tunnel out of local minima.
-4. **"Vacuum Decay" (Self-Healing Past):** When a new observation 48 GB away contradicts a page you already read, XenoMem dissolves the old page back into `PROT_NONE` void. Next time your code reads that pointer, reality re-crystallizes into a consistent timeline.
+1. **Lazy Demand-Paged Materialization (`mmap` + `SIGBUS`)**
+   `xeno_init` reserves a 64 GB `MAP_PRIVATE | MAP_ANON` region with `PROT_NONE`. When user code reads an unmapped page, `xeno_mmu_observer_trap` sends the faulting address over an async-signal-safe POSIX pipe to a parked coordinator thread, stages the 16 KB page containing any bound variables on that page, maps it `PROT_READ`, and resumes the faulting load instruction.
+2. **Direct ARM64 Pointer-Write Interception (`ESR_EL1.WnR`)**
+   When user code writes to `reality[offset] = +1`, the handler inspects the ARM64 Exception Syndrome Register (`uc_mcontext->__es.__esr`, bit 6 `WnR`), decodes the scalar `STRB`/`STURB` source register, pins that variable's spin, and invalidates stale pages. Writes to unbound offsets map `PROT_READ | PROT_WRITE` cleanly without hanging.
+3. **Single-Syscall Cache Invalidation ("Vacuum Decay")**
+   Pinning a variable that contradicts previously materialized pages (or calling `xeno_clear_hamiltonian`) re-maps the entire virtual range back to `PROT_NONE` via a single `mmap(..., MAP_FIXED | PROT_NONE)` call — supporting millions of pages with no fixed page-table cap and releasing physical pages back to XNU.
+4. **Demand-Gated Cross-QoS Contention Jitter (`0.0%` Idle CPU)**
+   `<stdlib.h>` is not included and CI verifies `nm -u` imports zero `rand`, `random`, `arc4random`, `getentropy`, or `open` symbols. During an active solve, two `QOS_CLASS_USER_INTERACTIVE` threads and two `QOS_CLASS_BACKGROUND` threads wake on a condition variable and race unsynchronized read-modify-writes with `cntvct_el0` across shared cache lines to drive stochastic WalkSAT steps, then park immediately back at `0.0%` CPU when the page fault completes.
+   * **Measuring unpredictability honestly**: A plain byte histogram (`Shannon entropy`) scores `8.00` even on a deterministic `0..255` counter. `demo.c` therefore reports **NIST SP 800-90B Min-Entropy** ($H_\infty$), **First-Order Markov Conditional Entropy** $H(X_t \mid X_{t-1})$ (`0.00` for a counter), **Lag-1 Serial Correlation**, and an explicit **Oscillators-OFF vs. Oscillators-ON** control.
+5. **$O(1)$ Occurrence-Indexed WalkSAT with Backtracking**
+   Variables maintain occurrence lists into clauses (`XENO_MAX_VARS = 1024`, `XENO_MAX_CLAUSES = 8192`) so flip deltas evaluate in $O(\text{degree})$ time. Unsatisfied partial assignments are never locked as observed; if earlier partial page observations trap a later solve, `xenomem` automatically invalidates prior pages (preserving explicit pins) and re-solves globally.
 
 ---
 
-## Try It on Your Mac in 5 Seconds
+## Build & Run
 
 ```bash
 git clone https://github.com/rossbuckley1990-hash/xenomem.git
 cd xenomem && make && ./xenomem
 ```
 
-### Live Output on an Apple M5 MacBook Air (`1.59 MB` RAM used for a `64.0 GB` universe)
-
-```text
-[1] PHYSICAL SILICON CONTENTION BATH (ZERO PRNG / ZERO SYSCALL ENTROPY AUDIT)
-    • Architecture     : 3 Super-Core Oscillators (4.6GHz) vs 3 Efficiency-Core Oscillators (3.0GHz)
-    • Coupling Medium  : Unsynchronized C Data-Races across M5 Cache-Coherency Fabric
-    • Measured Entropy : 7.9810 / 8.0000 bits/byte  |  Ones Balance: 49.76%
-
-[2] OBSERVER-COLLAPSED NP-HARD 3-SAT IN A 64 GB VOID (N=100 Spins, M=425 Clauses, α=4.25)
-    • Solver Function Called : NONE (Triggered purely by raw C pointer dereference `reality[addr]`)
-    • Clauses Crystallized   : 425 / 425 (100.0% Ground State Satisfaction!)
-    • Silicon Race Flips     : 11055 physical collision-driven flips in 41109.0 µs
-    • Materialized Pages     : 10 × 16 KB out of 64.0 GB (Total Process Footprint: 1.59 MB)
-
-[3] NON-LOCAL ENTANGLEMENT ACROSS 48 GB VOID & RETROCAUSAL VACUUM DECAY
-    • Timeline 1 Observation : reality[0 GB] = +1  |  reality[48 GB] = -1  (Entangled Bell Pair: VERIFIED)
-    • Paradox Injected @48GB : Pinning Bob = +1 contradicts Timeline 1 -> Triggered 2 Vacuum Decays!
-    • Timeline 2 Re-Read     : reality[0 GB] = -1  |  reality[48 GB] = +1  (Past Self-Healed: VERIFIED!)
-```
-
-Verify for yourself that there isn't a single random-number generator or `/dev/urandom` call in the compiled binary:
+Verify zero PRNG / entropy-device symbol imports:
 ```bash
 nm -u ./xenomem
 ```
