@@ -26,3 +26,5 @@ jobs:
         run: ./xenomem
       - name: Execute 256GB / 16-Thread / 4,250-Clause Stress Suite
         run: ./xenomem_stress
+      - name: Execute 4-Part Causal Problem/Solution Proof
+        run: ./xenomem_prove

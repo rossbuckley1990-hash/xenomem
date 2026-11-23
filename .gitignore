@@ -1,5 +1,6 @@
 xenomem
 xenomem_stress
+xenomem_prove
 stress_test
 *.o
 .DS_Store
